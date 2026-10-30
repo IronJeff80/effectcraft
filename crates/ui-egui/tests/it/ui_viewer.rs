@@ -2,6 +2,7 @@
 //! interest drawing, rulers and guides, snapping, the shape Pen and motion-path key drags
 //! (egui_kittest, UI logic only).
 
+use crate::gpu_test::RenderSerial;
 use effectcraft_engine::Session;
 use effectcraft_engine::commands::shape_tool::PaintKind;
 use effectcraft_engine::project::LayerId;
@@ -448,7 +449,7 @@ fn mid_drag(h: &mut Harness<'_, EffectcraftApp>, from: Pos2, to: Pos2, mods: egu
         h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
         h.step();
     }
-    h.render().expect("the mid-drag frame")
+    h.render_serialized().expect("the mid-drag frame")
 }
 
 /// Release the button where the drag left it.
@@ -490,7 +491,7 @@ fn shape_drag_ghost_shows_the_tools_own_shape_while_dragging() {
         h.state_mut().ui.tool = tool;
         settle_viewer(&mut h);
         let (a, b) = (screen(&h, from), screen(&h, to));
-        let before = h.render().expect("the frame before the drag");
+        let before = h.render_serialized().expect("the frame before the drag");
         let mid = mid_drag(&mut h, a, b, egui::Modifiers::default());
         let fill = fill_rgb(&h);
 
@@ -526,7 +527,7 @@ fn shape_drag_ghost_normalises_the_same_way_as_the_release() {
         h.state_mut().ui.tool = Tool::Ellipse;
         settle_viewer(&mut h);
         let (a, b) = (screen(&h, from.map(|v| v as f32)), screen(&h, to.map(|v| v as f32)));
-        let before = h.render().expect("the frame before the drag");
+        let before = h.render_serialized().expect("the frame before the drag");
         // Measured with the button down, so this is the ghost and not the committed shape.
         let mid = mid_drag(&mut h, a, b, mods);
         let on = [centre[0] as f32 + size[0] as f32 / 4.0, centre[1] as f32 + size[1] as f32 / 4.0];
@@ -595,7 +596,7 @@ fn a_layer_drag_moves_the_picture_while_the_button_is_down() {
     h.input_mut().events.push(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
     h.step();
     // Where the layer is not (yet): the plate behind it.
-    let plate = px_at(&h.render().unwrap(), &h, [440.0, 200.0]);
+    let plate = px_at(&h.render_serialized().unwrap(), &h, [440.0, 200.0]);
 
     // Drag in small steps, still holding the button, and give the renders a chance to land.
     let mut moved = false;
@@ -606,7 +607,7 @@ fn a_layer_drag_moves_the_picture_while_the_button_is_down() {
         std::thread::sleep(std::time::Duration::from_millis(15));
         // 30 comp px behind the pointer: inside the layer, well away from its outline, its anchor
         // icon and where it started.
-        let at = px_at(&h.render().expect("mid-drag frame"), &h, [320.0 + 200.0 * (i as f32 / 40.0) - 30.0, 200.0]);
+        let at = px_at(&h.render_serialized().expect("mid-drag frame"), &h, [320.0 + 200.0 * (i as f32 / 40.0) - 30.0, 200.0]);
         if i >= 30 && delta(at, plate) > 30 {
             moved = true;
             break;
@@ -829,6 +830,48 @@ fn shift_drag_keeps_a_mask_vertex_to_one_axis() {
     drag_path(&mut h, &[from, from + vec2(30.0, 8.0)], egui::Modifiers::NONE);
     let free = mask_path(&h, "Plate").vertices[0];
     assert!(free[0] > shifted[0] && free[1] > shifted[1], "without Shift both axes move: {shifted:?} -> {free:?}");
+}
+
+/// #999: a mask vertex dragged against the edge of the Composition panel pans the view, and the
+/// vertex keeps moving while the pointer is held there, as in After Effects.
+#[test]
+fn a_vertex_held_at_the_viewer_edge_pans_the_view() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    let corners = [[100.0, 60.0], [500.0, 60.0], [500.0, 300.0], [100.0, 300.0]];
+    let mask = {
+        let s = &mut h.state_mut().session;
+        s.execute("layer.select", json!({"layers": [plate]})).unwrap();
+        let m = s.execute("mask.new", json!({"layer": plate, "vertices": corners, "closed": true})).unwrap()["mask"].as_u64().unwrap();
+        s.execute("mask.selectVertices", json!({"vertices": [{"layer": plate, "mask": m, "index": 0}]})).unwrap();
+        m
+    };
+    h.run_steps(2);
+    let pan0 = h.state().ui.viewer.pan;
+    let from = rect(&h, &format!("viewer.mask.{mask}.vertex.0")).center();
+    let edge = pos2(2.0, from.y);
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    for i in 1..=6 {
+        h.input_mut().events.push(Event::PointerMoved(from + (edge - from) * (i as f32 / 6.0)));
+        h.step();
+    }
+    let reached = mask_path(&h, "Plate").vertices[0];
+    for _ in 0..20 {
+        h.step();
+    }
+    h.input_mut().events.push(Event::PointerButton { pos: edge, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+    let pan = h.state().ui.viewer.pan;
+    assert!(pan[0] > pan0[0] && pan[1] == pan0[1], "the view panned right to show more on the left: {pan0:?} -> {pan:?}");
+    let after = mask_path(&h, "Plate").vertices[0];
+    assert!(after[0] < reached[0], "the vertex kept moving left with the view: {reached:?} -> {after:?}");
+    // Back inside the view, nothing pans.
+    let still = h.state().ui.viewer.pan;
+    let mid = rect(&h, "viewer.comp").center();
+    drag(&mut h, mid, mid + vec2(5.0, 0.0));
+    assert_eq!(h.state().ui.viewer.pan, still);
 }
 
 /// #1769: a hidden masked layer keeps its mask path and vertices, and they remain editable.

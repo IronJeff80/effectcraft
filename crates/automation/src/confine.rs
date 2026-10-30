@@ -30,10 +30,9 @@ pub struct Confinement {
     write: Vec<PathBuf>,
 }
 
-/// Commands that run code, act outside the project or open other applications.
+/// Commands that run code, act outside the project or open other applications, besides the
+/// commands that run scripts ([`effectcraft_engine::commands::scripts::RUNS_SCRIPTS`]).
 const REFUSED: &[&str] = &[
-    "script.run",
-    "file.runScript",
     "file.installScript",
     "file.installScriptUIPanel",
     "file.uninstallScript",
@@ -97,6 +96,7 @@ const MIXED_WRITES: &[(&str, &[&str])] = &[("templates.create", &["projectPath",
 
 /// Commands that write files named by these parameters.
 const WRITES: &[(&str, &[&str])] = &[
+    ("camera.exportBlender", &["path"]),
     ("file.save", &["path"]),
     ("file.saveAs", &["path"]),
     ("file.saveCopy", &["path"]),
@@ -128,6 +128,9 @@ pub enum Lookup {
     ProjectFile,
     /// Every output of the queued Render Queue items (`renderQueue.list`).
     RenderOutputs,
+    /// Whether the open project has a file (`project.summary` → `path`): a Render Queue item
+    /// added without `output` writes beside it, or to the home folder before the first save.
+    QueueDefault,
 }
 
 impl Confinement {
@@ -167,7 +170,7 @@ impl Confinement {
     /// Check engine command `id` with `params` before it runs. Returns what must still be looked
     /// up and passed to [`Confinement::check_lookup`] for commands that write implicitly.
     pub fn check_command(&self, id: &str, params: &Value) -> Result<Option<Lookup>> {
-        if REFUSED.contains(&id) {
+        if REFUSED.contains(&id) || effectcraft_engine::commands::scripts::RUNS_SCRIPTS.contains(&id) {
             return Err(Error::BadArgs(format!("`{id}` is not available while file access is confined (--automation-read-root/--automation-write-root)")));
         }
         // Scripts can't grant themselves the access the user withheld
@@ -239,6 +242,10 @@ impl Confinement {
         if matches!(id, "file.openRecent" | "file.importRecent" | "anim.applyRecentPreset") && !given {
             return Err(Error::BadArgs(format!("`{id}`: give `path` while file access is confined")));
         }
+        // Without `output`, an unsaved project's item would write to the home folder (#2479).
+        if id == "renderQueue.add" && !given {
+            return Ok(Some(Lookup::QueueDefault));
+        }
         if IMPLICIT_WRITES.contains(&id) && !(given && id == "file.save") {
             return Ok(Some(if id == "file.save" || id == "file.incrementAndSave" { Lookup::ProjectFile } else { Lookup::RenderOutputs }));
         }
@@ -252,6 +259,13 @@ impl Confinement {
                 // Increment and Save writes beside it.
                 Some(p) => self.check(p, Access::Write).map(drop),
                 None => Err(Error::BadArgs("the project has no file yet: give `path` (Save As) inside an automation write root".into())),
+            },
+            // A saved project's default output sits beside it, and rendering checks it then.
+            Lookup::QueueDefault => match found.get("path").and_then(Value::as_str) {
+                Some(_) => Ok(()),
+                None => Err(Error::BadArgs(
+                    "`renderQueue.add`: the project has no file yet, so the default output would go to the home folder: give `output` inside an automation write root".into(),
+                )),
             },
             Lookup::RenderOutputs => {
                 let items = found.get("items").or(Some(found)).and_then(Value::as_array).cloned().unwrap_or_default();
@@ -397,6 +411,7 @@ mod tests {
             let classified = keys_of(READS, id).is_some()
                 || keys_of(WRITES, id).is_some()
                 || REFUSED.contains(&id)
+                || effectcraft_engine::commands::scripts::RUNS_SCRIPTS.contains(&id)
                 || IMPLICIT_WRITES.contains(&id)
                 || id.starts_with("renderQueue.")
                 || id == "render.addOutputModule"
